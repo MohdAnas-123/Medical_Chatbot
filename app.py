@@ -3,20 +3,18 @@ from flask import Flask, render_template, request
 from dotenv import load_dotenv
 
 from src.helper import download_hugging_face_embeddings
-from src.prompt import system_prompt # Ensure system_prompt is correctly imported
+from src.prompt import system_prompt, contextualize_q_system_prompt
 
 from langchain_pinecone import PineconeVectorStore
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import create_retrieval_chain
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 
-# 1. Initialize Flask App & Environment
 app = Flask(__name__)
-load_dotenv() # This automatically handles your GOOGLE_API_KEY and PINECONE_API_KEY
+load_dotenv() 
 
-# 2. Setup Embeddings & Vector Store
-print("Initializing Embeddings and connecting to Pinecone...")
 embeddings = download_hugging_face_embeddings()
 index_name = "medical-chatbot" 
 
@@ -24,50 +22,67 @@ docsearch = PineconeVectorStore.from_existing_index(
     index_name=index_name,
     embedding=embeddings
 )
-retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k":3})
 
-# 3. Setup LLM & Chain
-print("Initializing Google Gemini Model...")
 chatModel = ChatGoogleGenerativeAI(model='gemini-3.1-flash-lite-preview')
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
+# 1. Memory Reformulator Prompt
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", contextualize_q_system_prompt),
+    MessagesPlaceholder("chat_history"),
     ("human", "{input}"),
 ])
+history_aware_retriever = create_history_aware_retriever(chatModel, retriever, contextualize_q_prompt)
 
-question_answer_chain = create_stuff_documents_chain(chatModel, prompt)
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+# 2. Main Question Answering Prompt
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+question_answer_chain = create_stuff_documents_chain(chatModel, qa_prompt)
+
+# 3. Final Conversational Chain
+rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 print("System Ready!")
 
-# ----------------- FLASK ROUTES -----------------
+# Global memory list (Note: For local testing only. In a real multi-user app, use session IDs)
+chat_history = []
 
 @app.route("/")
 def index():
     return render_template('chat.html')
 
-@app.route("/get", methods=["POST"]) # Usually, chat submissions only need POST
+@app.route("/get", methods=["POST"])
 def chat():
-    # Get the user's message from the frontend
+    global chat_history
     msg = request.form.get("msg", "")
-    print(f"User Query: {msg}")
     
-    # Check if the user sent an empty message
     if not msg:
         return "Please enter a valid question."
 
-    # Added Error Handling for web robustness
     try:
-        response = rag_chain.invoke({"input": msg})
-        print(f"Bot Response: {response['answer']}")
-        return str(response["answer"])
+        # Pass input AND history to the chain
+        response = rag_chain.invoke({
+            "input": msg, 
+            "chat_history": chat_history 
+        })
+        
+        answer = response['answer']
+        
+        # Save memory for the next turn
+        chat_history.append(HumanMessage(content=msg))
+        chat_history.append(AIMessage(content=answer))
+        
+        # Keep memory short to save API costs
+        if len(chat_history) > 10:
+            del chat_history[0:2]
+            
+        return str(answer)
         
     except Exception as e:
-        # If the API fails, the app won't crash. It will return a polite error to the user.
-        error_msg = f"Sorry, I encountered an error while processing your request: {str(e)}"
-        print(error_msg)
-        return error_msg
+        print(f"Error: {str(e)}")
+        return "Sorry, I encountered an error. Please try again."
 
-# Added the run block so you can start the app directly via `python app.py`
 if __name__ == '__main__':
-    # debug=True automatically reloads the server when you save changes to this file!
     app.run(host="0.0.0.0", port=5000, debug=True)
